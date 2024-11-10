@@ -1,187 +1,206 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <signal.h>
-#include <string.h>
-#include <elf.h>
-#include <errno.h>
+#include "loader.h"
 
-// Constants
-#define PAGE_SIZE 4096
+Elf32_Ehdr *elf_header;
+Elf32_Phdr *prog_header;
+int file_desc;
+int prog_header_size;
+Elf32_Phdr **prog_header_array;
 
-// Global counters for tracking page faults and allocations
+int total_prog_headers, header_offset, start_address;
 int page_fault_count = 0;
-int page_alloc_count = 0;
-int internal_fragmentation_kb = 0;
+int page_allocation_count = 0;
+int unused_memory = 0;
+int MEM_PAGE_SIZE = 4096;
 
-// Memory segment details
-typedef struct {
-    Elf32_Addr vaddr;
-    size_t memsz;
-    void *mapped_addr;
-} SegmentInfo;
+void* entry_address;
 
-// Array to store segments and count
-SegmentInfo segments[10];
-int segment_count = 0;
+typedef struct mapped_header {
+    Elf32_Phdr* map_header;
+    int region_size;
+} mapped_header;
 
-// Function to handle segmentation fault and lazy load pages
-void segfault_handler(int sig, siginfo_t *si, void *unused) {
-    void *fault_addr = si->si_addr;
-    int page_found = 0;
+mapped_header **free_array;
 
-    for (int i = 0; i < segment_count; ++i) {
-        Elf32_Addr segment_start = segments[i].vaddr;
-        Elf32_Addr segment_end = segment_start + segments[i].memsz;
+void cleanup_loader() {
+    free(elf_header);
+    for (int i = 0; i < total_prog_headers; i++) {
+        free(prog_header_array[i]);
+    }
+    free(prog_header_array);
 
-        // Check if faulting address falls within the segment range
-        if ((Elf32_Addr)fault_addr >= segment_start && (Elf32_Addr)fault_addr < segment_end) {
-            page_found = 1;
-            void *page_addr = (void *)((uintptr_t)fault_addr & ~(PAGE_SIZE - 1));
-
-            // Map the memory page
-            if (mmap(page_addr, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
-                perror("mmap");
-                exit(EXIT_FAILURE);
+    for (int i = 0; i < total_prog_headers; i++) {
+        if (free_array[i] != NULL) {
+            if (munmap(free_array[i]->map_header, free_array[i]->region_size) == -1) {
+                perror("Error: munmap");
+                exit(0);
             }
-
-            // Track page allocations and internal fragmentation
-            page_alloc_count++;
-            internal_fragmentation_kb += (PAGE_SIZE - (segments[i].memsz % PAGE_SIZE)) / 1024;
-
-            // Load page contents if needed (you may copy data if available)
-            memcpy(page_addr, (void *)(segments[i].mapped_addr + (page_addr - (void *)segment_start)),
-                   PAGE_SIZE);
-
-            break;
+            free(free_array[i]);
         }
     }
-
-    if (!page_found) {
-        fprintf(stderr, "Segmentation fault at address %p, not in any mapped segment\n", fault_addr);
-        exit(EXIT_FAILURE);
-    }
-
-    // Increase the page fault count
-    page_fault_count++;
+    free(free_array);
 }
 
-// Initialize signal handler for segmentation faults
-void setup_segfault_handler() {
-    struct sigaction sa;
-    sa.sa_flags = SA_SIGINFO;
-    sa.sa_sigaction = segfault_handler;
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGSEGV, &sa, NULL) == -1) {
-        perror("sigaction");
-        exit(EXIT_FAILURE);
+void verify_elf(char** executable) {
+    file_desc = open(*executable, O_RDONLY);
+    if (file_desc == -1) {
+        perror("Error opening file");
+        exit(0);
+    }
+    int header_size = sizeof(Elf32_Ehdr);
+    elf_header = (Elf32_Ehdr*)malloc(header_size * sizeof(char));
+    if (elf_header == NULL) {
+        perror("Error: malloc");
+        exit(0);
+    }
+    lseek(file_desc, 0, SEEK_SET);
+    read(file_desc, elf_header, header_size);
+    if (elf_header->e_ident[EI_MAG0] != ELFMAG0 || elf_header->e_ident[EI_MAG1] != ELFMAG1 ||
+             elf_header->e_ident[EI_MAG2] != ELFMAG2 || elf_header->e_ident[EI_MAG3] != ELFMAG3) {
+        printf("Invalid ELF file.\n");
+        free(elf_header);
+        exit(0);
+    }
+    free(elf_header);
+    if (close(file_desc) == -1) {
+        perror("Error closing file");
+        exit(0);
     }
 }
 
-// Validate ELF header
-int validate_elf_header(const Elf32_Ehdr *ehdr) {
-    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
-        fprintf(stderr, "File is not in ELF format (incorrect magic number)\n");
-        return 0;
-    }
-    if (ehdr->e_ident[EI_CLASS] != ELFCLASS32) {
-        fprintf(stderr, "Only ELF 32-bit files are supported\n");
-        return 0;
-    }
-    if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) {
-        fprintf(stderr, "File is not in little-endian format\n");
-        return 0;
-    }
-    if (ehdr->e_type != ET_EXEC) {
-        fprintf(stderr, "Only ELF executables are supported\n");
-        return 0;
-    }
-    if (ehdr->e_machine != EM_386) {
-        fprintf(stderr, "Unsupported machine architecture. Only x86 is supported\n");
-        return 0;
-    }
-    return 1;
-}
+void execute_elf(char** executable) {
 
-// Load ELF headers and set up lazy loading
-void load_elf(const char *filename) {
-    int fd = open(filename, O_RDONLY);
-    if (fd < 0) {
-        perror("open");
-        exit(EXIT_FAILURE);
+    file_desc = open(*executable, O_RDONLY);
+    if (file_desc == -1) {
+        perror("Error opening file");
+        exit(0);
+    }
+    int buffer_size = lseek(file_desc, 0, SEEK_END);
+    if (buffer_size == -1) {
+        perror("Error with lseek");
+        exit(0);
     }
 
-    // Read ELF header
-    Elf32_Ehdr ehdr;
-    if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
-        perror("read ELF header");
-        close(fd);
-        exit(EXIT_FAILURE);
+    int elf_header_size = sizeof(Elf32_Ehdr);
+    elf_header = (Elf32_Ehdr*) malloc(elf_header_size * sizeof(char));
+    if (elf_header == NULL) {
+        perror("Error: malloc");
+        exit(0);
+    }
+    if (lseek(file_desc, 0, SEEK_SET) == -1) {
+        perror("Error with lseek");
+        exit(0);
+    }
+    if (read(file_desc, elf_header, elf_header_size) == -1) {
+        perror("Error reading file");
+        exit(0);
     }
 
-    // Validate ELF header
-    if (!validate_elf_header(&ehdr)) {
-        close(fd);
-        exit(EXIT_FAILURE);
+    total_prog_headers = elf_header->e_phnum;
+    header_offset = elf_header->e_phoff;
+    prog_header_size = elf_header->e_phentsize;
+    start_address = elf_header->e_entry;
+
+    prog_header_array = (Elf32_Phdr**)malloc(prog_header_size * sizeof(char) * total_prog_headers);
+    if (prog_header_array == NULL) {
+        perror("Error: malloc");
+        exit(0);
+    }
+    free_array = (mapped_header**)malloc(sizeof(mapped_header) * total_prog_headers);
+    if (free_array == NULL) {
+        perror("Error: malloc");
+        exit(0);
     }
 
-    // Read program headers
-    lseek(fd, ehdr.e_phoff, SEEK_SET);
-    for (int i = 0; i < ehdr.e_phnum; ++i) {
-        Elf32_Phdr phdr;
-        if (read(fd, &phdr, sizeof(phdr)) != sizeof(phdr)) {
-            perror("read program header");
-            close(fd);
-            exit(EXIT_FAILURE);
+    for (int i = 0; i < total_prog_headers; i++) {
+        Elf32_Phdr* temp_header = (Elf32_Phdr*)malloc(prog_header_size * sizeof(char));
+        if (temp_header == NULL) {
+            perror("Error: malloc");
+            exit(0);
         }
+        if (lseek(file_desc, header_offset + i * prog_header_size, SEEK_SET) == -1) {
+            perror("Error with lseek");
+            exit(0);
+        }
+        if (read(file_desc, temp_header, prog_header_size) == -1) {
+            perror("Error reading file");
+            exit(0);
+        }
+        prog_header_array[i] = temp_header;
+    }
 
-        if (phdr.p_type == PT_LOAD) {
-            // Set up segment details for lazy loading
-            segments[segment_count].vaddr = phdr.p_vaddr;
-            segments[segment_count].memsz = phdr.p_memsz;
-            segments[segment_count].mapped_addr = mmap(NULL, phdr.p_memsz,
-                                                       PROT_READ | PROT_WRITE | PROT_EXEC,
-                                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    entry_address = (void*)start_address;
+    int (*_start_function)() = (int(*)())(entry_address);
+    int result = _start_function();
+    printf("User _start return value = %d\n", result);
+    printf("Total page faults = %d\n", page_fault_count);
+    printf("Total page allocations = %d\n", page_allocation_count);
+    printf("Internal fragmentation in KB = %.2f\n", (double)unused_memory / 1024);
+    if (close(file_desc) == -1) {
+        perror("Error closing file");
+        exit(0);
+    }
+}
 
-            if (segments[segment_count].mapped_addr == MAP_FAILED) {
-                perror("mmap for segment");
-                close(fd);
-                exit(EXIT_FAILURE);
+static void signal_handler(int signal_num, siginfo_t *info, void *context) {
+    if (signal_num == SIGSEGV) {
+        void* fault_addr = info->si_addr;
+        page_fault_count++;
+        for (int i = 0; i < total_prog_headers; i++) {
+            int virtual_addr = prog_header_array[i]->p_vaddr;
+            if (virtual_addr <= (int)fault_addr &&
+                (virtual_addr + prog_header_array[i]->p_memsz) > (int)fault_addr) {
+                int segment_size = prog_header_array[i]->p_memsz;
+                int pages_needed = (segment_size + (int)MEM_PAGE_SIZE - 1) / (int)MEM_PAGE_SIZE;
+                prog_header = (Elf32_Phdr*)mmap((void*)virtual_addr, pages_needed * MEM_PAGE_SIZE, 
+                                                PROT_READ | PROT_WRITE | PROT_EXEC, 
+                                                MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+                if ((int)prog_header == -1) {
+                    perror("Error: mmap");
+                    exit(0);
+                }
+                unused_memory += (pages_needed * MEM_PAGE_SIZE) - segment_size;
+                page_allocation_count += pages_needed;
+                if (lseek(file_desc, prog_header_array[i]->p_offset, SEEK_SET) == -1) {
+                    perror("Error with lseek");
+                    exit(0);
+                }
+                if (read(file_desc, prog_header, prog_header_array[i]->p_memsz) == -1) {
+                    perror("Error reading file");
+                    exit(0);
+                }
+
+                mapped_header* temp = NULL;
+                temp = (mapped_header*)malloc(sizeof(mapped_header));
+                if (temp == NULL) {
+                    perror("Error: malloc");
+                    exit(0);
+                }
+                temp->map_header = prog_header;
+                temp->region_size = pages_needed * MEM_PAGE_SIZE;
+                free_array[i] = temp;
+                break;
             }
-
-            // Copy segment data for lazy loading on page fault
-            pread(fd, segments[segment_count].mapped_addr, phdr.p_filesz, phdr.p_offset);
-
-            segment_count++;
         }
     }
-
-    close(fd);
-
-    // Call the entry point (_start)
-    void (*entry)() = (void (*)())ehdr.e_entry;
-    entry();
-
-    // Print statistics
-    printf("Total page faults: %d\n", page_fault_count);
-    printf("Total page allocations: %d\n", page_alloc_count);
-    printf("Total internal fragmentation: %d KB\n", internal_fragmentation_kb);
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     if (argc != 2) {
-        fprintf(stderr, "Usage: %s <ELF file>\n", argv[0]);
-        exit(EXIT_FAILURE);
+        printf("Usage: %s <ELF Executable>\n", argv[0]);
+        exit(1);
     }
 
-    // Setup segmentation fault handler
-    setup_segfault_handler();
+    struct sigaction saction;
+    memset(&saction, 0, sizeof(saction));
+    saction.sa_sigaction = signal_handler;
+    saction.sa_flags = SA_SIGINFO;
+    if (sigaction(SIGSEGV, &saction, NULL) == -1) {
+        perror("Error: sigaction");
+        exit(0);
+    }
 
-    // Load and execute the ELF
-    load_elf(argv[1]);
-
+    verify_elf(&argv[1]);
+    execute_elf(&argv[1]);
+    cleanup_loader();
     return 0;
 }
